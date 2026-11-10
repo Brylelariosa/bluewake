@@ -1,5 +1,5 @@
 
-name: BlueWake Android APK
+name: BlueWake Android Build
 
 on:
   workflow_dispatch:
@@ -9,17 +9,12 @@ permissions:
 
 jobs:
   build:
-    runs-on: windows-2025
+    runs-on: ubuntu-24.04
     timeout-minutes: 360
 
     steps:
       - name: Checkout BlueWake
         uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
 
       - name: Setup Java
         uses: actions/setup-java@v4
@@ -27,87 +22,84 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
 
-      - name: Install Android dependencies
-        shell: pwsh
+      - name: Install Linux dependencies
         run: |
-          $ErrorActionPreference = 'Stop'
-          sdkmanager --install `
-            "platform-tools" `
-            "platforms;android-35" `
-            "build-tools;35.0.0" `
-            "ndk;29.0.14206865"
-
-          if ($LASTEXITCODE -ne 0) {
-            throw "Android SDK installation failed"
-          }
+          sudo apt-get update
+          sudo apt-get install -y \
+            clang \
+            ninja-build \
+            git \
+            build-essential \
+            pkg-config \
+            libvulkan-dev \
+            libx11-dev \
+            libxrandr-dev \
+            libxinerama-dev \
+            libxcursor-dev \
+            libxi-dev \
+            libxkbcommon-dev \
+            libwayland-dev \
+            libasound2-dev \
+            libpulse-dev \
+            libdbus-1-dev \
+            libxss-dev \
+            libxtst-dev \
+            zlib1g-dev \
+            libpng-dev \
+            libfreetype6-dev \
+            libsqlite3-dev \
+            libzstd-dev \
+            libfmt-dev \
+            libbz2-dev \
+            libbrotli-dev \
+            libicu-dev
 
       - name: Install Python dependencies
         run: |
-          python -m pip install --disable-pip-version-check -r scripts/wwhd/requirements.txt
-          python -m pip install ninja
+          python -m pip install --upgrade pip
+          python -m pip install -r scripts/wwhd/requirements.txt
+          python -m pip install ninja cmake
 
-      - name: Download private ISO
-        shell: pwsh
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK and NDK
+        run: |
+          sdkmanager --install \
+            "platform-tools" \
+            "platforms;android-35" \
+            "build-tools;35.0.0" \
+            "ndk;29.0.14206865"
+
+      - name: Download private game ISO
         env:
           GH_TOKEN: ${{ secrets.GAMEFILES_TOKEN }}
         run: |
-          $ErrorActionPreference = 'Stop'
+          mkdir -p "$RUNNER_TEMP/bluewake-disc"
 
-          $disc = "$env:RUNNER_TEMP\bluewake-disc"
-          New-Item -ItemType Directory -Force -Path $disc | Out-Null
+          gh release download iso-v1 \
+            --repo Brylelariosa/BlueWake-GameFiles \
+            --pattern "*.iso" \
+            --dir "$RUNNER_TEMP/bluewake-disc"
 
-          gh release download iso-v1 `
-            --repo Brylelariosa/BlueWake-GameFiles `
-            --pattern "*.iso" `
-            --dir $disc
+          ISO=$(find "$RUNNER_TEMP/bluewake-disc" \
+            -maxdepth 1 -name "*.iso" -print -quit)
 
-          if ($LASTEXITCODE -ne 0) {
-            throw "ISO download failed"
-          }
-
-          $iso = Get-ChildItem $disc -Filter "*.iso" |
-            Select-Object -First 1
-
-          if (-not $iso) {
-            throw "ISO file not found"
-          }
-
-          "BLUEWAKE_ISO=$($iso.FullName)" |
-            Out-File -FilePath $env:GITHUB_ENV -Append
+          test -n "$ISO"
+          echo "BLUEWAKE_ISO=$ISO" >> "$GITHUB_ENV"
 
       - name: Build Android APK
-        shell: pwsh
         run: |
-          $ErrorActionPreference = 'Stop'
-
-          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-
-          $vs = & $vswhere -latest -products '*' `
-            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
-            -property installationPath
-
-          if (-not $vs) {
-            throw "Visual Studio C++ tools not found"
-          }
-
-          $llvm = Join-Path $vs 'VC\Tools\Llvm\x64'
-
-          if (-not (Test-Path "$llvm\bin\clang-cl.exe")) {
-            throw "Visual Studio LLVM clang-cl not found"
-          }
-
-          python scripts/android/build.py "$env:BLUEWAKE_ISO" `
-            --llvm "$llvm" `
-            --sdk "$env:ANDROID_HOME" `
-            --jdk "$env:JAVA_HOME" `
+          python scripts/android/build.py \
+            "$BLUEWAKE_ISO" \
+            --sdk "$ANDROID_HOME" \
+            --jdk "$JAVA_HOME" \
             --jobs 2
-
-          if ($LASTEXITCODE -ne 0) {
-            throw "BlueWake Android build failed"
-          }
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
@@ -115,4 +107,4 @@ jobs:
           name: BlueWake-Android-APK
           path: build/android/WindWakerRecomp.apk
           if-no-files-found: error
-          retention-days: 3
+          retention-days: 7
