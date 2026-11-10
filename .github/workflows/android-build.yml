@@ -67,6 +67,10 @@ jobs:
 
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          # The action's default runs `sdkmanager tools`, which no longer exists
+          # in current cmdline-tools. Packages are installed in the next step.
+          packages: ''
 
       - name: Install Android SDK and NDK
         run: |
