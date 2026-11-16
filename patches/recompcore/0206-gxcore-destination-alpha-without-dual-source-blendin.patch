@@ -1,0 +1,159 @@
+From cf3ab624c092718514bb2f96263e4d7e10285537 Mon Sep 17 00:00:00 2001
+From: Brylelariosa <Brylelariosa@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 12:00:00 +0000
+Subject: [PATCH] gxcore: destination alpha without dual-source blending
+
+GX destination alpha (BP 0x42) writes a constant alpha while the colour
+still blends on the fragment's own alpha. gxcore did that with a second
+fragment output (`enable dual_source_blending;`, @blend_src(1)), which
+needs WebGPU's dual-source blending. A GPU without it (Mali-G52 on the
+Infinix HOT 11) refused the module the first time such a pipeline was
+made, and the game stopped with "extension 'dual_source_blending' is not
+allowed" from CreateShaderModule.
+
+create_pipeline now makes the pipeline in a single-source form when the
+device lacks the feature (ShaderKey::use_dst_alpha 2, a value the plan
+never sets: 0 none, 1 dual-source, 2 the constant in the one output):
+
+- the colour does not blend on source alpha (no blend, one/zero, add and
+  subtract modes, destination factors): the one output's alpha is the
+  constant and the alpha channel is written One/Zero, exactly as with
+  the feature;
+- the colour blends on source alpha (SrcAlpha or InvSrcAlpha on either
+  side): one output cannot carry that alpha and the constant, so the
+  colour stays exact and the destination alpha is left as it was;
+- the ubershader has no constant-alpha form and takes the second case.
+
+The pipeline config, its cache key and the persisted rows are untouched;
+only create_pipeline looks at the device, so rows made on a GPU with the
+feature compile here too. A GPU with the feature gets the key back
+unchanged and builds what it built before.
+---
+ .../graphics/aurora/lib/gfx/gxcore_draw.cpp   | 44 +++++++++++++++++--
+ .../graphics/gxcore/src/gxcore_shader.cpp     | 15 +++++--
+ 2 files changed, 51 insertions(+), 8 deletions(-)
+
+diff --git a/GXRuntime/graphics/aurora/lib/gfx/gxcore_draw.cpp b/GXRuntime/graphics/aurora/lib/gfx/gxcore_draw.cpp
+index 0408528..52b8959 100644
+--- a/GXRuntime/graphics/aurora/lib/gfx/gxcore_draw.cpp
++++ b/GXRuntime/graphics/aurora/lib/gfx/gxcore_draw.cpp
+@@ -561,13 +561,48 @@
+   return !always_passes;
+ }
+ 
++// GX destination alpha (BP 0x42) writes a constant alpha while the colour still
++// blends on the fragment's own alpha. That takes two fragment outputs, which is
++// WebGPU's dual-source blending, and not every GPU has it (Mali-G52 does not):
++// a shader that says `enable dual_source_blending;` there is refused when its
++// module is made. So the pipeline is made in a single-source form instead
++// (ShaderKey::use_dst_alpha: 0 none, 1 dual-source, 2 the constant in the one
++// output):
++//  - the colour does not blend on source alpha: the output's alpha is the
++//    constant, written exactly as on a GPU with the feature (2);
++//  - the colour blends on source alpha: it needs the fragment's alpha, and one
++//    output cannot carry that and the constant, so the colour stays exact and
++//    the destination alpha is left as it was (0, no alpha write).
++// The ubershader has no constant-alpha form: it takes the second case always.
++// A GPU with dual-source blending gets the key unchanged.
++static gxc::PipelineKey single_source_dst_alpha(gxc::PipelineKey key, bool uber) {
++  if (key.shader.use_dst_alpha == 0 || webgpu::g_dualSourceBlendingSupported)
++    return key;
++  const auto src = static_cast<gxc::SrcBlendFactor>(key.src_factor);
++  const auto dst = static_cast<gxc::DstBlendFactor>(key.dst_factor);
++  const bool blendsOnSourceAlpha =
++      key.blend_enable != 0 && key.blend_subtract == 0 &&
++      (src == gxc::SrcBlendFactor::SrcAlpha ||
++       src == gxc::SrcBlendFactor::InvSrcAlpha ||
++       dst == gxc::DstBlendFactor::SrcAlpha ||
++       dst == gxc::DstBlendFactor::InvSrcAlpha);
++  if (uber || blendsOnSourceAlpha) {
++    key.shader.use_dst_alpha = 0;
++    key.alpha_update = 0;
++  } else {
++    key.shader.use_dst_alpha = 2;
++  }
++  return key;
++}
++
+ wgpu::RenderPipeline create_pipeline(const PipelineConfig& config) {
+-  const gxc::PipelineKey& key = config.key;
++  const gxc::PipelineKey key =
++      single_source_dst_alpha(config.key, config.depthOnly == 2u);
+   // depthOnly 2: the ubershader for this fixed-function state (the key's
+   // shader is empty but for destination alpha), drawing any shader key.
+   const bool uber = config.depthOnly == 2u;
+   const bool depthOnly = config.depthOnly == 1u;
+-  CHECK(key.shader.use_dst_alpha == 0 ||
++  CHECK(key.shader.use_dst_alpha != 1 ||
+             webgpu::g_dualSourceBlendingSupported,
+         "GX destination alpha requires WebGPU dual-source blending");
+   std::string wgsl = uber ? gxc::generate_uber_wgsl(key.shader.use_dst_alpha != 0) : gxc::generate_wgsl(key.shader);
+@@ -696,7 +731,8 @@ wgpu::RenderPipeline create_pipeline(const PipelineConfig& config) {
+   };
+ 
+   // GC subtract mode forces ONE/ONE with dst - src (Dolphin RenderState).
+-  const bool dual_source = key.shader.use_dst_alpha != 0;
++  const bool dual_source = key.shader.use_dst_alpha == 1;
++  const bool constant_alpha = key.shader.use_dst_alpha != 0;
+   wgpu::BlendState blendState{};
+   if (key.blend_subtract != 0) {
+     blendState.color = {
+@@ -704,7 +740,7 @@ wgpu::RenderPipeline create_pipeline(const PipelineConfig& config) {
+         .srcFactor = wgpu::BlendFactor::One,
+         .dstFactor = wgpu::BlendFactor::One,
+     };
+-    blendState.alpha = dual_source
++    blendState.alpha = constant_alpha
+                            ? wgpu::BlendComponent{
+                                  .operation = wgpu::BlendOperation::Add,
+                                  .srcFactor = wgpu::BlendFactor::One,
+diff --git a/GXRuntime/graphics/gxcore/src/gxcore_shader.cpp b/GXRuntime/graphics/gxcore/src/gxcore_shader.cpp
+index 21d781a..31ceb73 100644
+--- a/GXRuntime/graphics/gxcore/src/gxcore_shader.cpp
++++ b/GXRuntime/graphics/gxcore/src/gxcore_shader.cpp
+@@ -43,7 +43,7 @@
+ 
+ void emit_fragment_entry(std::string& out, const ShaderKey& key) {
+   const bool writes_depth = key.ztex_op != 0;
+-  if (key.use_dst_alpha != 0) {
++  if (key.use_dst_alpha == 1) {
+     emit(out,
+          "struct FragmentOut {\n"
+          "    @location(0) @blend_src(0) color: vec4f,\n"
+@@ -569,7 +569,11 @@ void emit_fragment_entry(std::string& out, const ShaderKey& key) {
+          "    let ztex_depth = 1.0 - f32(ztex_z) / 16777216.0;\n");
+   }
+ 
+-  if (key.use_dst_alpha != 0) {
++  // use_dst_alpha 2 (no dual-source blending): the constant alpha goes out in
++  // the one output, and the returns below are the ordinary ones.
++  if (key.use_dst_alpha == 2)
++    emitf(out, "    prev.a = %u;\n", static_cast<unsigned>(key.dst_alpha));
++  if (key.use_dst_alpha == 1) {
+     if (key.ztex_op != 0)
+       emitf(out,
+             "    return FragmentOut(vec4f(vec3f(prev.rgb), %u.0) / 255.0, "
+@@ -739,7 +743,7 @@ void emit_fragment_entry(std::string& out, const ShaderKey& key) {
+ 
+   std::string out;
+   out.reserve(4096);
+-  if (key.use_dst_alpha != 0)
++  if (key.use_dst_alpha == 1)
+     emit(out, "enable dual_source_blending;\n\n");
+   const bool tev = key.tev_valid != 0;
+   const bool lit = key.lit_valid != 0;
+@@ -1084,7 +1088,10 @@ void emit_fragment_entry(std::string& out, const ShaderKey& key) {
+     }
+     emit(out, "    prev = textureSample(tex0, samp0, uv);\n");
+   }
+-  if (key.use_dst_alpha != 0) {
++  if (key.use_dst_alpha == 2)
++    emitf(out, "    prev.a = %u.0 / 255.0;\n",
++          static_cast<unsigned>(key.dst_alpha));
++  if (key.use_dst_alpha == 1) {
+     emitf(out,
+           "    return FragmentOut(vec4f(prev.rgb, %u.0 / 255.0), "
+           "vec4f(0.0, 0.0, 0.0, prev.a));\n}\n",
+-- 
+2.43.0
+
