@@ -3,9 +3,20 @@ name: BlueWake Android Build
 
 on:
   workflow_dispatch:
+    inputs:
+      rebuild_module:
+        description: >-
+          Compile the game module again (about 2.5 hours) instead of reusing the cached one.
+          Needed after a change the cache key cannot see, or when the cache has expired.
+        type: boolean
+        default: false
 
 permissions:
   contents: read
+
+env:
+  # The NDK compiles the game module, so its version is part of the module's cache key.
+  NDK_VERSION: "29.0.14206865"
 
 jobs:
   build:
@@ -78,9 +89,47 @@ jobs:
             "platform-tools" \
             "platforms;android-35" \
             "build-tools;35.0.0" \
-            "ndk;29.0.14206865"
+            "ndk;${NDK_VERSION}"
 
+      - name: Machine
+        run: |
+          echo "nproc: $(nproc)"
+          free -m
+
+      # The game module (libgGZLE01_recomp.so, about 2.5 hours to compile) is cached so that a change to the app
+      # alone builds in minutes. What the module's key (scripts/android/module_cache_key.py) is made of:
+      #   the RecompCore and DolRecomp pins and the composite digest, cmake/composite, mods, scripts/mods,
+      #   config/stage_select, scripts/windows, the module-shaping part of scripts/android/build.py, a
+      #   patches/recompcore patch that touches what the module compiles, and the NDK version above.
+      # Not in it, so these leave the cache valid: android/ (Java, manifest, android_entry.c, libmain.so's CMake),
+      #   the other patches in patches/recompcore (0206 reaches libmain.so only), packaging, this workflow.
+      # The cache holds code translated from the disc. A cache is private to its repository only when the
+      # repository is: a public one never saves or restores it.
+      - name: Game module cache key
+        id: module-key
+        run: python scripts/android/module_cache_key.py --ndk "$NDK_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: No game module cache in a public repository
+        if: ${{ !github.event.repository.private }}
+        run: |
+          echo "::warning::This repository is public, so the game module (code translated from the disc) is not cached and is compiled every time."
+
+      - name: Restore game module cache
+        id: module-cache
+        if: ${{ !inputs.rebuild_module && github.event.repository.private }}
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            build/android/composite/gGZLE01_recomp.so
+            build/android/composite/module.json
+          # A saved key ends in its run's id, so the newest save under this key's prefix is found.
+          key: ${{ steps.module-key.outputs.key }}-none
+          restore-keys: |
+            ${{ steps.module-key.outputs.key }}-
+
+      # --app-only never opens the disc, so a restored module needs no download of it.
       - name: Download private game ISO
+        if: ${{ steps.module-cache.outputs.cache-matched-key == '' }}
         env:
           GH_TOKEN: ${{ secrets.GAMEFILES_TOKEN }}
         run: |
@@ -98,12 +147,39 @@ jobs:
           echo "BLUEWAKE_ISO=$ISO" >> "$GITHUB_ENV"
 
       - name: Build Android APK
+        env:
+          MODULE_RESTORED: ${{ steps.module-cache.outputs.cache-matched-key != '' }}
         run: |
-          python scripts/android/build.py \
-            "$BLUEWAKE_ISO" \
-            --sdk "$ANDROID_HOME" \
-            --jdk "$JAVA_HOME" \
-            --jobs 2
+          if [ "$MODULE_RESTORED" = "true" ]; then
+            echo "Reusing the cached game module: app only"
+            python scripts/android/build.py \
+              "$RUNNER_TEMP/disc-not-needed.iso" \
+              --sdk "$ANDROID_HOME" \
+              --jdk "$JAVA_HOME" \
+              --app-only
+          else
+            python scripts/android/build.py \
+              "$BLUEWAKE_ISO" \
+              --sdk "$ANDROID_HOME" \
+              --jdk "$JAVA_HOME"
+          fi
+
+      # Saved even when the app or the packaging failed after the module compiled (module.json is written once
+      # the module is complete), so a failed app build does not cost the compile again.
+      - name: Save game module cache
+        if: ${{ always() && github.event.repository.private && steps.module-cache.outputs.cache-matched-key == '' && hashFiles('build/android/composite/module.json') != '' }}
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            build/android/composite/gGZLE01_recomp.so
+            build/android/composite/module.json
+          key: ${{ steps.module-key.outputs.key }}-${{ github.run_id }}
+
+      # Sizes and names only; changes nothing.
+      - name: Library size report
+        if: ${{ always() }}
+        continue-on-error: true
+        run: python scripts/android/size_report.py --ndk "$ANDROID_HOME/ndk/$NDK_VERSION" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
