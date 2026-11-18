@@ -6,8 +6,15 @@ on:
     inputs:
       rebuild_module:
         description: >-
-          Compile the game module again (about 2.5 hours) instead of reusing the cached one.
-          Needed after a change the cache key cannot see, or when the cache has expired.
+          Compile the game module again (1.5 to 2.5 hours) instead of reusing the stored one.
+          Needed after a change the key cannot see, or if the stored module was deleted.
+        type: boolean
+        default: false
+      public_artifact:
+        description: >-
+          This repository is public, so an uploaded artifact can be downloaded by anyone, and the APK holds code
+          translated from the disc. By default the APK is left in the private store instead. Turn this on to
+          upload it as an artifact anyway when that store cannot be written.
         type: boolean
         default: false
 
@@ -15,8 +22,12 @@ permissions:
   contents: read
 
 env:
-  # The NDK compiles the game module, so its version is part of the module's cache key.
+  # The compiler of the game module, so its version is in the module's key. build.py would take the newest NDK on
+  # the runner (a preview, NDK 30, in run 3), so it is told this one.
   NDK_VERSION: "29.0.14206865"
+  # A private repository (the one the disc comes from) where this build keeps what is translated from the disc:
+  # the compiled game module, and the APK when this repository is public.
+  STORE_REPO: Brylelariosa/BlueWake-GameFiles
 
 jobs:
   build:
@@ -65,6 +76,7 @@ jobs:
             libfreetype6-dev \
             libsqlite3-dev \
             libzstd-dev \
+            zstd \
             libfmt-dev \
             libbz2-dev \
             libbrotli-dev \
@@ -96,40 +108,70 @@ jobs:
           echo "nproc: $(nproc)"
           free -m
 
-      # The game module (libgGZLE01_recomp.so, about 2.5 hours to compile) is cached so that a change to the app
-      # alone builds in minutes. What the module's key (scripts/android/module_cache_key.py) is made of:
+      # The game module (libgGZLE01_recomp.so, 1.5 to 2.5 hours to compile) is kept in the private store, so that
+      # a change to the app alone builds in minutes. What its key (scripts/android/module_cache_key.py) is made of:
       #   the RecompCore and DolRecomp pins and the composite digest, cmake/composite, mods, scripts/mods,
       #   config/stage_select, scripts/windows, the module-shaping part of scripts/android/build.py, a
       #   patches/recompcore patch that touches what the module compiles, and the NDK version above.
-      # Not in it, so these leave the cache valid: android/ (Java, manifest, android_entry.c, libmain.so's CMake),
-      #   the other patches in patches/recompcore (0206 reaches libmain.so only), packaging, this workflow.
-      # The cache holds code translated from the disc. A cache is private to its repository only when the
-      # repository is: a public one never saves or restores it.
-      - name: Game module cache key
+      # Not in it, so these leave the stored module valid: android/ (Java, manifest, android_entry.c, libmain.so's
+      #   CMake), the other patches in patches/recompcore (0206 reaches libmain.so only), packaging, this workflow.
+      - name: Game module key
         id: module-key
         run: python scripts/android/module_cache_key.py --ndk "$NDK_VERSION" >> "$GITHUB_OUTPUT"
 
-      - name: No game module cache in a public repository
-        if: ${{ !github.event.repository.private }}
+      # Code translated from the disc stays in STORE_REPO, which must be private. This repository's cache and
+      # artifacts are as public as the repository is (it is public: run 3 had 4 cores and 16 GB), so neither is used
+      # for it. The check writes and deletes a release: the token has to be able to.
+      - name: Private store
+        id: store
+        env:
+          GH_TOKEN: ${{ secrets.GAMEFILES_TOKEN }}
+          REPO_PRIVATE: ${{ github.event.repository.private }}
+          PUBLIC_ARTIFACT: ${{ inputs.public_artifact }}
         run: |
-          echo "::warning::This repository is public, so the game module (code translated from the disc) is not cached and is compiled every time."
+          ok=false
+          if [ "$(gh api "repos/$STORE_REPO" --jq .private 2>/dev/null)" = "true" ]; then
+            probe="write-check-$GITHUB_RUN_ID"
+            if gh release create "$probe" --repo "$STORE_REPO" --title "write check" \
+                --notes "CI write check, deleted at once." >/dev/null 2>&1; then
+              gh release delete "$probe" --repo "$STORE_REPO" --cleanup-tag --yes >/dev/null 2>&1 || true
+              ok=true
+            fi
+          fi
+          echo "ok=$ok" >> "$GITHUB_OUTPUT"
+          if [ "$ok" = "true" ]; then
+            echo "$STORE_REPO is private and the token can write to it."
+          else
+            echo "::warning::$STORE_REPO is not private, or GAMEFILES_TOKEN cannot write to it (it needs Contents: read and write): the game module is compiled every time."
+            if [ "$REPO_PRIVATE" != "true" ] && [ "$PUBLIC_ARTIFACT" != "true" ]; then
+              echo "::error::This repository is public, so an uploaded APK (it holds code translated from the disc) could be downloaded by anyone, and there is no private store to leave it in. Give GAMEFILES_TOKEN write access to $STORE_REPO, or run again with public_artifact on."
+              exit 1
+            fi
+          fi
 
-      - name: Restore game module cache
+      - name: Restore the game module from the private store
         id: module-cache
-        if: ${{ !inputs.rebuild_module && github.event.repository.private }}
-        uses: actions/cache/restore@v4
-        with:
-          path: |
-            build/android/composite/gGZLE01_recomp.so
-            build/android/composite/module.json
-          # A saved key ends in its run's id, so the newest save under this key's prefix is found.
-          key: ${{ steps.module-key.outputs.key }}-none
-          restore-keys: |
-            ${{ steps.module-key.outputs.key }}-
+        if: ${{ steps.store.outputs.ok == 'true' && !inputs.rebuild_module }}
+        env:
+          GH_TOKEN: ${{ secrets.GAMEFILES_TOKEN }}
+          TAG: ${{ steps.module-key.outputs.key }}
+        run: |
+          dir="$RUNNER_TEMP/module-store"
+          mkdir -p "$dir" build/android/composite
+          if gh release download "$TAG" --repo "$STORE_REPO" --dir "$dir" >/dev/null 2>&1 \
+              && zstd -d -q -f "$dir/gGZLE01_recomp.so.zst" -o build/android/composite/gGZLE01_recomp.so \
+              && cp "$dir/module.json" build/android/composite/module.json; then
+            echo "restored=true" >> "$GITHUB_OUTPUT"
+            echo "Restored the game module $TAG"
+          else
+            rm -f build/android/composite/gGZLE01_recomp.so build/android/composite/module.json
+            echo "restored=false" >> "$GITHUB_OUTPUT"
+            echo "No stored game module for $TAG: it is compiled."
+          fi
 
       # --app-only never opens the disc, so a restored module needs no download of it.
       - name: Download private game ISO
-        if: ${{ steps.module-cache.outputs.cache-matched-key == '' }}
+        if: ${{ steps.module-cache.outputs.restored != 'true' }}
         env:
           GH_TOKEN: ${{ secrets.GAMEFILES_TOKEN }}
         run: |
@@ -148,32 +190,45 @@ jobs:
 
       - name: Build Android APK
         env:
-          MODULE_RESTORED: ${{ steps.module-cache.outputs.cache-matched-key != '' }}
+          MODULE_RESTORED: ${{ steps.module-cache.outputs.restored == 'true' }}
         run: |
           if [ "$MODULE_RESTORED" = "true" ]; then
-            echo "Reusing the cached game module: app only"
+            echo "Reusing the stored game module: app only"
             python scripts/android/build.py \
               "$RUNNER_TEMP/disc-not-needed.iso" \
               --sdk "$ANDROID_HOME" \
               --jdk "$JAVA_HOME" \
+              --ndk "$ANDROID_HOME/ndk/$NDK_VERSION" \
               --app-only
           else
             python scripts/android/build.py \
               "$BLUEWAKE_ISO" \
               --sdk "$ANDROID_HOME" \
-              --jdk "$JAVA_HOME"
+              --jdk "$JAVA_HOME" \
+              --ndk "$ANDROID_HOME/ndk/$NDK_VERSION"
           fi
 
-      # Saved even when the app or the packaging failed after the module compiled (module.json is written once
-      # the module is complete), so a failed app build does not cost the compile again.
-      - name: Save game module cache
-        if: ${{ always() && github.event.repository.private && steps.module-cache.outputs.cache-matched-key == '' && hashFiles('build/android/composite/module.json') != '' }}
-        uses: actions/cache/save@v4
-        with:
-          path: |
-            build/android/composite/gGZLE01_recomp.so
-            build/android/composite/module.json
-          key: ${{ steps.module-key.outputs.key }}-${{ github.run_id }}
+      # Kept even when the app or the packaging failed after the module compiled (module.json is written once
+      # the module is complete), so a failed app build does not cost the compile again. Compressed: most of the
+      # 800 MB is debug information.
+      - name: Keep the game module in the private store
+        if: ${{ always() && steps.store.outputs.ok == 'true' && steps.module-cache.outputs.restored != 'true' && hashFiles('build/android/composite/module.json') != '' }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GAMEFILES_TOKEN }}
+          TAG: ${{ steps.module-key.outputs.key }}
+        run: |
+          zstd -T0 -3 -q -f build/android/composite/gGZLE01_recomp.so -o "$RUNNER_TEMP/gGZLE01_recomp.so.zst"
+          gh release delete "$TAG" --repo "$STORE_REPO" --cleanup-tag --yes >/dev/null 2>&1 || true
+          gh release create "$TAG" --repo "$STORE_REPO" \
+            --title "Game module $TAG" \
+            --notes "The compiled Android game module (code translated from the disc): a private cache for the Android build, written by CI." \
+            "$RUNNER_TEMP/gGZLE01_recomp.so.zst" build/android/composite/module.json
+          # Only the newest module is of any use: the other modules this workflow made go.
+          gh release list --repo "$STORE_REPO" --limit 100 --json tagName --jq '.[].tagName' \
+            | grep '^bluewake-android-module-' | grep -vx "$TAG" \
+            | xargs -r -n1 gh release delete --repo "$STORE_REPO" --cleanup-tag --yes || true
+          echo "Stored the game module $TAG"
 
       # Sizes and names only; changes nothing.
       - name: Library size report
@@ -181,10 +236,26 @@ jobs:
         continue-on-error: true
         run: python scripts/android/size_report.py --ndk "$ANDROID_HOME/ndk/$NDK_VERSION" >> "$GITHUB_STEP_SUMMARY"
 
+      # An artifact of a public repository is public, and the APK holds code translated from the disc: there it
+      # is only uploaded when public_artifact says so.
       - name: Upload APK
+        if: ${{ github.event.repository.private || inputs.public_artifact }}
         uses: actions/upload-artifact@v4
         with:
           name: BlueWake-Android-APK
           path: build/android/WindWakerRecomp.apk
           if-no-files-found: error
           retention-days: 7
+
+      - name: Leave the APK in the private store
+        if: ${{ !github.event.repository.private && steps.store.outputs.ok == 'true' && hashFiles('build/android/WindWakerRecomp.apk') != '' }}
+        env:
+          GH_TOKEN: ${{ secrets.GAMEFILES_TOKEN }}
+        run: |
+          tag=android-apk-latest
+          gh release delete "$tag" --repo "$STORE_REPO" --cleanup-tag --yes >/dev/null 2>&1 || true
+          gh release create "$tag" --repo "$STORE_REPO" \
+            --title "BlueWake Android APK, run $GITHUB_RUN_NUMBER" \
+            --notes "Built by $GITHUB_REPOSITORY run $GITHUB_RUN_NUMBER at $GITHUB_SHA. It holds code translated from the disc: private." \
+            build/android/WindWakerRecomp.apk
+          echo "The APK is the release $tag of $STORE_REPO"

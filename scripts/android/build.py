@@ -118,6 +118,45 @@ class AndroidBuilder(wb.Builder):
         return subprocess.run(["git", "-C", str(self.recompcore), "apply", "--whitespace=nowarn", *args],
                               capture_output=True, text=True)
 
+    def explain_patch_failure(self, patch):
+        """Print, for each hunk whose old lines are not in the pinned source as written, its first missing line, the
+        nearest line that exists and the source around it: enough to mend the patch from the build log alone."""
+        import difflib
+        text = patch.read_text(encoding="utf-8", errors="replace")
+        for section in re.split(r"^diff --git ", text, flags=re.M)[1:]:
+            name = section.split(" b/", 1)[1].split("\n", 1)[0].strip()
+            path = self.recompcore / name
+            if not path.is_file():
+                print(f"  {name}: not in the pinned RecompCore", file=sys.stderr)
+                continue
+            source = [line.rstrip() for line in path.read_text(encoding="utf-8", errors="replace").splitlines()]
+            known = [line.strip() for line in source]
+            hunks = re.split(r"^@@ ", section, flags=re.M)[1:]
+            printed = 0
+            for hunk in hunks:
+                head, *body = hunk.split("\n")
+                if "-- " in body:  # the signature git format-patch ends a patch with
+                    body = body[:body.index("-- ")]
+                old = [line[1:].rstrip() for line in body if line[:1] in " -" and not line.startswith("---")]
+                while old and not old[-1].strip():
+                    old.pop()
+                if any(source[i:i + len(old)] == old for i in range(len(source) - len(old) + 1)):
+                    continue  # this hunk's old lines are there, together, as written
+                printed += 1
+                missing = [line.strip() for line in old if line.strip() and line.strip() not in known]
+                anchor = missing[0] if missing else next((line.strip() for line in old if line.strip()), "")
+                print(f"  {name} @@ {head.split('@@')[0].strip()}: "
+                      + (f"{len(missing)} of its old lines are not in the source" if missing
+                         else "its old lines are all there, but not in this order"), file=sys.stderr)
+                print(f"    expected: {anchor[:110]}", file=sys.stderr)
+                near = difflib.get_close_matches(anchor, known, n=1, cutoff=0.4) if missing else [anchor]
+                if near and near[0] in known:
+                    at = known.index(near[0])
+                    print(f"    nearest, line {at + 1}:", file=sys.stderr)
+                    for number in range(max(0, at - 4), min(len(source), at + 5)):
+                        print(f"      {number + 1:5d} {source[number][:130]}", file=sys.stderr)
+            print(f"  {name}: {len(hunks) - printed} of {len(hunks)} hunks match as written", file=sys.stderr)
+
     def dependencies(self):
         rc = self.recompcore
         applied = rc / ".git" / "bluewake-applied-patches"
@@ -140,6 +179,12 @@ class AndroidBuilder(wb.Builder):
                 continue
             done = self.patch_runtime(str(patch))
             if done.returncode:
+                # Outer context lines that moved since the patch was written: one line of context on each side still pins it.
+                done = self.patch_runtime("-C1", str(patch))
+                if done.returncode == 0:
+                    print(f"{patch.name}: the outer context lines differ; applied with one line of context (-C1)")
+            if done.returncode:
+                self.explain_patch_failure(patch)
                 die(f"{patch.name} does not apply to the pinned RecompCore ({done.stderr.strip()})")
             self.applied_runtime_patches.append(patch.name)
             print(f"{patch.name}: applied on top of the pinned RecompCore")

@@ -1,4 +1,4 @@
-From cf3ab624c092718514bb2f96263e4d7e10285537 Mon Sep 17 00:00:00 2001
+From 414423a9a2b339e42db911904be0724706252867 Mon Sep 17 00:00:00 2001
 From: Brylelariosa <Brylelariosa@users.noreply.github.com>
 Date: Wed, 11 Nov 2026 12:00:00 +0000
 Subject: [PATCH] gxcore: destination alpha without dual-source blending
@@ -34,11 +34,11 @@ unchanged and builds what it built before.
  2 files changed, 51 insertions(+), 8 deletions(-)
 
 diff --git a/GXRuntime/graphics/aurora/lib/gfx/gxcore_draw.cpp b/GXRuntime/graphics/aurora/lib/gfx/gxcore_draw.cpp
-index 0408528..52b8959 100644
+index 0ad6df3..fcd3572 100644
 --- a/GXRuntime/graphics/aurora/lib/gfx/gxcore_draw.cpp
 +++ b/GXRuntime/graphics/aurora/lib/gfx/gxcore_draw.cpp
-@@ -561,13 +561,48 @@
-   return !always_passes;
+@@ -563,13 +563,48 @@
+   return !alpha_test_always_passes(key.shader);
  }
  
 +// GX destination alpha (BP 0x42) writes a constant alpha while the colour still
@@ -88,7 +88,7 @@ index 0408528..52b8959 100644
              webgpu::g_dualSourceBlendingSupported,
          "GX destination alpha requires WebGPU dual-source blending");
    std::string wgsl = uber ? gxc::generate_uber_wgsl(key.shader.use_dst_alpha != 0) : gxc::generate_wgsl(key.shader);
-@@ -696,7 +731,8 @@ wgpu::RenderPipeline create_pipeline(const PipelineConfig& config) {
+@@ -698,7 +733,8 @@ wgpu::RenderPipeline create_pipeline(const PipelineConfig& config) {
    };
  
    // GC subtract mode forces ONE/ONE with dst - src (Dolphin RenderState).
@@ -98,7 +98,7 @@ index 0408528..52b8959 100644
    wgpu::BlendState blendState{};
    if (key.blend_subtract != 0) {
      blendState.color = {
-@@ -704,7 +740,7 @@ wgpu::RenderPipeline create_pipeline(const PipelineConfig& config) {
+@@ -706,7 +742,7 @@ wgpu::RenderPipeline create_pipeline(const PipelineConfig& config) {
          .srcFactor = wgpu::BlendFactor::One,
          .dstFactor = wgpu::BlendFactor::One,
      };

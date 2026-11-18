@@ -39,7 +39,7 @@ FILES = ("scripts/generate_composite.py", "scripts/ios/composite_manifest.py")
 # functions and methods by name, and the module-level constants only they read.
 APP_ONLY = {"configure_app", "build_app", "app_profile", "sdl_java_dir", "package", "apk_provenance", "DEVICE_FILES",
             "adb", "train_on_device", "app_training_fingerprint", "train_app_on_device", "device_training_run",
-            "runtime_patches", "patch_runtime", "dependencies", "memory_jobs",
+            "runtime_patches", "patch_runtime", "explain_patch_failure", "dependencies", "memory_jobs",
             "ACTIVITY", "DEFAULT_LABEL", "TARGET_SDK", "RUNTIME_PATCH_LIST", "PACKAGE_STRIP"}
 # What the module compiles from the pinned RecompCore (cmake/composite/CMakeLists.txt): a patch touching these is an input.
 MODULE_SOURCES = ("GXRuntime/src/core/", "GXRuntime/include/", "Source/Core/Core/PowerPC/StaticRecomp/", "DolRecomp/")
